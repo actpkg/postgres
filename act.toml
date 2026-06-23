@@ -1,3 +1,10 @@
 [std]
 name = "postgres"
 
+[std.capabilities."wasi:sockets"]
+description = "TCP connection to a PostgreSQL server."
+
+[[std.capabilities."wasi:sockets".allow]]
+host = "*"
+ports = [5432, 5433, 5434, 5435, 5436, 5437, 5438, 5439, 5440]
+protocols = ["tcp"]
