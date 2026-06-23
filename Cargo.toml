@@ -1,0 +1,29 @@
+[package]
+name = "component-postgres"
+description = "Hardened PostgreSQL access for AI agents — capability-gated, tiered, bounded"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+keywords = ["act", "postgres", "postgresql", "sql", "wasm"]
+repository = "https://github.com/actpkg/postgres"
+
+[dependencies]
+act-sdk = "0.11"
+wit-bindgen = { version = "0.58", features = ["async-spawn"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+ciborium = "0.2"
+tokio = { version = "1.51", features = ["rt", "net", "time", "macros"] }
+tokio-postgres = "0.7"
+sqlparser = "0.52"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+opt-level = "z"
+panic = "abort"
+
+[lib]
+crate-type = ["cdylib"]

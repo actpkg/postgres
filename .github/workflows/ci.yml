@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: moonrepo/setup-rust@v1
+        with:
+          bins: wkg, just
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - run: just init
+      - run: just build
+      - uses: actions/upload-artifact@v7
+        with:
+          name: component.wasm
+          path: target/wasm32-wasip2/release/*.wasm
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: moonrepo/setup-rust@v1
+        with:
+          bins: wkg, just
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - run: cargo fmt -- --check
+      - run: just init
+      - run: cargo clippy -- -D warnings
+
+  e2e:
+    name: E2E Test
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: component.wasm
+          path: target/wasm32-wasip2/release/
+      - uses: moonrepo/setup-rust@v1
+        with:
+          bins: just, hurl
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - run: just test
+
+  publish:
+    name: Publish
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: [e2e, lint]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read      # checkout
+      id-token: write     # keyless cosign signing via GitHub OIDC
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: component.wasm
+          path: target/wasm32-wasip2/release/
+      - uses: moonrepo/setup-rust@v1
+        with:
+          bins: just
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: sigstore/cosign-installer@v4.1.2   # defaults to cosign 3.x → OCI 1.1 referrer signatures
+      - name: Publish
+        id: publish
+        env:
+          # actpkg.dev PAT (any username; the registry detects the PAT by prefix).
+          # Create one at actpkg.dev and add it as the ACTPKG_TOKEN repo secret.
+          OCI_USERNAME: __token__
+          OCI_PASSWORD: ${{ secrets.ACTPKG_TOKEN }}
+          # Source repo URL for org.opencontainers.image.source (read by act-build).
+          ACT_SOURCE: ${{ github.server_url }}/${{ github.repository }}
+        run: just publish
+      - name: Sign (keyless via GitHub OIDC)
+        if: steps.publish.outputs.digest != ''
+        env:
+          ACTPKG_TOKEN: ${{ secrets.ACTPKG_TOKEN }}
+          SUBJECT: ${{ steps.publish.outputs.image }}@${{ steps.publish.outputs.digest }}
+        run: |
+          echo "$ACTPKG_TOKEN" | cosign login actpkg.dev -u __token__ --password-stdin
+          cosign sign --yes "$SUBJECT"
