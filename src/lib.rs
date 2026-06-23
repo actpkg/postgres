@@ -2,7 +2,7 @@ use act_sdk::prelude::*;
 use ciborium::value::Value as Cv;
 
 mod conn;
-use conn::Connection;
+use conn::{Connection, SslMode};
 
 #[act_component]
 mod component {
@@ -40,12 +40,14 @@ mod component {
 
     #[session_open]
     fn open(args: OpenArgs) -> ActResult<String> {
+        // TODO(task-N): thread sslmode through OpenArgs; for now default to Disable.
         let conn = Connection::open(
             &args.host,
             args.port,
             &args.user,
             args.password.as_deref(),
             &args.dbname,
+            SslMode::Disable,
         )
         .map_err(ActError::internal)?;
         Ok(SESSIONS.with(|r| r.insert(conn)))
