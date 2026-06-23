@@ -2,6 +2,7 @@ use act_sdk::prelude::*;
 use ciborium::value::Value as Cv;
 
 pub mod classify;
+pub mod convert;
 pub mod mode;
 
 mod conn;

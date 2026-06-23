@@ -290,6 +290,7 @@ name = "component-postgres"
 version = "0.1.0"
 dependencies = [
  "act-sdk",
+ "bytes",
  "ciborium",
  "rustls",
  "rustls-rustcrypto",
