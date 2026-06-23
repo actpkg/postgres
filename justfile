@@ -10,6 +10,10 @@ hurl := env("HURL", "hurl")
 port := `shuf -i 10000-29999 -n 1`
 addr := "[::1]:" + port
 baseurl := "http://" + addr
+# Second server port for the read-only enforcement test.
+port2 := `shuf -i 10000-29999 -n 1`
+addr2 := "[::1]:" + port2
+baseurl2 := "http://" + addr2
 
 # Fetch WIT deps from the registry (ghcr.io/actcore) into wit/deps/.
 # wkg-registry.toml maps the act namespace -> actcore.dev (well-known -> ghcr.io/actcore).
@@ -29,10 +33,26 @@ pack: build
 test: pack
     #!/usr/bin/env bash
     set -euo pipefail
-    {{act}} run {{wasm}} --http --listen "{{addr}}" &
-    trap "kill $!" EXIT
+    docker compose up -d --wait
+    SA_FULL='{"host":"127.0.0.1","port":5434,"user":"postgres","password":"postgres","dbname":"postgres","sslmode":"disable","mode":"full"}'
+    SA_RO='{"host":"127.0.0.1","port":5434,"user":"postgres","password":"postgres","dbname":"postgres","sslmode":"disable","mode":"read-only"}'
+    {{act}} run {{wasm}} --http --listen "{{addr}}" --allow wasi:sockets --session-args "$SA_FULL" &
+    PID=$!
+    {{act}} run {{wasm}} --http --listen "{{addr2}}" --allow wasi:sockets --session-args "$SA_RO" &
+    PID2=$!
+    trap "kill $PID $PID2 2>/dev/null || true; docker compose down -v" EXIT
     curl --retry 60 --retry-connrefused --retry-delay 1 -fsS -o /dev/null {{baseurl}}/info
-    {{hurl}} --test --variable "baseurl={{baseurl}}" e2e/*.hurl
+    curl --retry 60 --retry-connrefused --retry-delay 1 -fsS -o /dev/null {{baseurl2}}/info
+    # hurl --test sorts files alphabetically; create test schema before the run
+    # so introspection/explain (e,i) can find act_e2e_users created in query_execute (q).
+    curl -fsS -X POST "{{baseurl}}/tools/execute" \
+      -H "Content-Type: application/json" \
+      -d '{"arguments":{"sql":"DROP TABLE IF EXISTS act_e2e_users"}}' -o /dev/null
+    curl -fsS -X POST "{{baseurl}}/tools/execute" \
+      -H "Content-Type: application/json" \
+      -d '{"arguments":{"sql":"CREATE TABLE act_e2e_users (id serial primary key, name text not null, age int)"}}' -o /dev/null
+    {{hurl}} --test --variable "baseurl={{baseurl}}" e2e/info.hurl e2e/list_tools.hurl e2e/query_execute.hurl e2e/introspection.hurl e2e/explain.hurl
+    {{hurl}} --test --variable "baseurl={{baseurl2}}" e2e/readonly.hurl
 
 publish: pack
     #!/usr/bin/env bash
