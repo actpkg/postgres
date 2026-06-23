@@ -135,22 +135,172 @@ mod component {
             .ok_or_else(|| ActError::session_not_found("Missing std:session-id metadata"))
     }
 
-    // ── Tools (Phase-0 placeholder; real tools wired in Task 8) ──────────────
+    // ── Tier gate helper ─────────────────────────────────────────────────────
 
-    /// Phase-0 spike tool: runs a read-only query and returns CBOR rows.
-    /// Replaced by the full tool suite in Task 8.
-    #[act_tool(description = "Run a read-only SQL query", read_only)]
+    fn gate(conn: &Connection, sql: &str) -> ActResult<()> {
+        mode::require_tier(conn.mode(), sql)
+            .map(|_| ())
+            .map_err(|g: mode::GateError| ActError::capability_denied(g.summary))
+    }
+
+    // ── Tools ─────────────────────────────────────────────────────────────────
+
+    #[act_tool(
+        description = "Execute a read-only SQL query (SELECT/CTE) and return rows. \
+                       Rejected if it is not read-only or exceeds the session mode.",
+        read_only
+    )]
     fn query(
-        /// SQL query to execute.
+        /// A single read-only SQL statement.
         sql: String,
+        /// Bind values for $1, $2, ... (optional).
+        params: Option<Vec<convert::PgParam>>,
+        /// Override the session's default row cap (optional).
+        max_rows: Option<u32>,
         ctx: &mut ActContext<ToolMeta>,
-    ) -> ActResult<Vec<Cv>> {
+    ) -> ActResult<Cv> {
         let id = require_session(ctx)?;
         with_session(&id, |c| {
-            let (rows, _truncated) = c
-                .query_rows(&sql, &[], c.default_max_rows())
+            classify::assert_single_statement(&sql).map_err(ActError::invalid_args)?;
+            gate(c, &sql)?;
+            let cap = max_rows.map(|n| n as usize).unwrap_or(c.default_max_rows());
+            let (rows, truncated) = c
+                .query_rows(&sql, params.as_deref().unwrap_or(&[]), cap)
                 .map_err(ActError::internal)?;
-            Ok(rows)
+            Ok(Cv::Map(vec![
+                (Cv::Text("rows".into()), Cv::Array(rows)),
+                (Cv::Text("truncated".into()), Cv::Bool(truncated)),
+            ]))
+        })
+    }
+
+    #[act_tool(
+        description = "Execute a write/DDL SQL statement (INSERT/UPDATE/DELETE/CREATE/...). \
+                       Each statement is classified and checked against the session mode."
+    )]
+    fn execute(
+        /// A single SQL statement.
+        sql: String,
+        /// Bind values for $1, $2, ... (optional).
+        params: Option<Vec<convert::PgParam>>,
+        ctx: &mut ActContext<ToolMeta>,
+    ) -> ActResult<Cv> {
+        let id = require_session(ctx)?;
+        with_session(&id, |c| {
+            classify::assert_single_statement(&sql).map_err(ActError::invalid_args)?;
+            gate(c, &sql)?;
+            let affected = c
+                .execute_sql(&sql, params.as_deref().unwrap_or(&[]))
+                .map_err(ActError::internal)?;
+            Ok(Cv::Map(vec![(
+                Cv::Text("rows_affected".into()),
+                Cv::from(affected as i64),
+            )]))
+        })
+    }
+
+    #[act_tool(
+        description = "List non-system schemas in the database.",
+        read_only
+    )]
+    fn list_schemas(ctx: &mut ActContext<ToolMeta>) -> ActResult<Cv> {
+        let id = require_session(ctx)?;
+        with_session(&id, |c| {
+            let sql = "SELECT schema_name FROM information_schema.schemata \
+                       WHERE schema_name NOT IN ('pg_catalog','information_schema') \
+                       AND schema_name NOT LIKE 'pg_toast%' AND schema_name NOT LIKE 'pg_temp%' \
+                       ORDER BY schema_name";
+            let (rows, _) = c
+                .query_rows(sql, &[], usize::MAX)
+                .map_err(ActError::internal)?;
+            Ok(Cv::Array(rows))
+        })
+    }
+
+    #[act_tool(
+        description = "List tables and views in a schema (default 'public').",
+        read_only
+    )]
+    fn list_tables(
+        /// Schema to inspect. Defaults to 'public'.
+        schema: Option<String>,
+        ctx: &mut ActContext<ToolMeta>,
+    ) -> ActResult<Cv> {
+        let id = require_session(ctx)?;
+        with_session(&id, |c| {
+            let s = schema.unwrap_or_else(|| "public".to_string());
+            let sql = "SELECT table_name, table_type FROM information_schema.tables \
+                       WHERE table_schema = $1 ORDER BY table_name";
+            let (rows, _) = c
+                .query_rows(sql, &[convert::PgParam(Cv::Text(s))], usize::MAX)
+                .map_err(ActError::internal)?;
+            Ok(Cv::Array(rows))
+        })
+    }
+
+    #[act_tool(
+        description = "Describe a table: columns, types, nullability, defaults.",
+        read_only
+    )]
+    fn describe_table(
+        /// Table name.
+        table: String,
+        /// Schema. Defaults to 'public'.
+        schema: Option<String>,
+        ctx: &mut ActContext<ToolMeta>,
+    ) -> ActResult<Cv> {
+        let id = require_session(ctx)?;
+        with_session(&id, |c| {
+            let s = schema.unwrap_or_else(|| "public".to_string());
+            let sql = "SELECT column_name, data_type, is_nullable, column_default \
+                       FROM information_schema.columns \
+                       WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position";
+            let (rows, _) = c
+                .query_rows(
+                    sql,
+                    &[
+                        convert::PgParam(Cv::Text(s)),
+                        convert::PgParam(Cv::Text(table.clone())),
+                    ],
+                    usize::MAX,
+                )
+                .map_err(ActError::internal)?;
+            if rows.is_empty() {
+                return Err(ActError::not_found(format!("Table not found: {table}")));
+            }
+            Ok(Cv::Map(vec![
+                (Cv::Text("table".into()), Cv::Text(table)),
+                (Cv::Text("columns".into()), Cv::Array(rows)),
+            ]))
+        })
+    }
+
+    #[act_tool(
+        description = "Return the query plan via EXPLAIN. analyze=false (default) does \
+                       NOT execute the query; analyze=true requires the statement's tier.",
+        read_only
+    )]
+    fn explain_query(
+        /// SQL statement to explain.
+        sql: String,
+        /// Run EXPLAIN ANALYZE (executes the query). Default false.
+        analyze: Option<bool>,
+        /// Output format: text | json. Default text.
+        format: Option<String>,
+        ctx: &mut ActContext<ToolMeta>,
+    ) -> ActResult<Cv> {
+        let id = require_session(ctx)?;
+        with_session(&id, |c| {
+            classify::assert_single_statement(&sql).map_err(ActError::invalid_args)?;
+            let analyze = analyze.unwrap_or(false);
+            // analyze=true executes the statement, so it must clear the real tier gate.
+            if analyze {
+                gate(c, &sql)?;
+            }
+            let plan = c
+                .explain(&sql, analyze, format.as_deref().unwrap_or("text"))
+                .map_err(ActError::internal)?;
+            Ok(Cv::Array(plan))
         })
     }
 }

@@ -220,7 +220,7 @@ impl tokio_postgres::tls::TlsConnect<TcpStream> for PgTlsConnect {
                 .connector
                 .connect(self.domain, stream)
                 .await
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
             Ok(PgTlsStream(tls_stream))
         })
     }
@@ -273,6 +273,7 @@ impl Connection {
             .get_hosts()
             .iter()
             .find_map(|h| {
+                #[allow(irrefutable_let_patterns)]
                 if let tokio_postgres::config::Host::Tcp(s) = h {
                     Some(s.clone())
                 } else {
