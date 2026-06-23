@@ -42,11 +42,29 @@ impl ToSql for PgParam {
             Cv::Integer(i) => {
                 let n: i128 = (*i).into();
                 match *ty {
-                    Type::INT2 => (n as i16).to_sql(ty, out),
-                    Type::INT4 => (n as i32).to_sql(ty, out),
+                    Type::INT2 => i16::try_from(n)
+                        .map_err(|_| {
+                            Box::<dyn Error + Sync + Send>::from(format!(
+                                "value {n} out of range for INT2"
+                            ))
+                        })?
+                        .to_sql(ty, out),
+                    Type::INT4 => i32::try_from(n)
+                        .map_err(|_| {
+                            Box::<dyn Error + Sync + Send>::from(format!(
+                                "value {n} out of range for INT4"
+                            ))
+                        })?
+                        .to_sql(ty, out),
                     Type::FLOAT4 => (n as f32).to_sql(ty, out),
                     Type::FLOAT8 => (n as f64).to_sql(ty, out),
-                    _ => (n as i64).to_sql(ty, out), // INT8 and fallback
+                    _ => i64::try_from(n)
+                        .map_err(|_| {
+                            Box::<dyn Error + Sync + Send>::from(format!(
+                                "value {n} out of range for INT8"
+                            ))
+                        })?
+                        .to_sql(ty, out), // INT8 and fallback
                 }
             }
             Cv::Float(f) => match *ty {
@@ -71,22 +89,27 @@ pub fn param_refs(params: &[PgParam]) -> Vec<&(dyn ToSql + Sync)> {
 /// as a CBOR text marker so a query never panics (type coverage is incremental).
 fn cell_to_cbor(row: &Row, i: usize) -> Cv {
     let ty = row.columns()[i].type_().clone();
+    // Distinguish Ok(Some(v)) → value, Ok(None) → Null, Err(_) → decode-error marker.
     macro_rules! get {
-        ($t:ty) => {
-            row.try_get::<_, Option<$t>>(i).ok().flatten()
+        ($t:ty, $map:expr) => {
+            match row.try_get::<_, Option<$t>>(i) {
+                Ok(Some(v)) => $map(v),
+                Ok(None) => Cv::Null,
+                Err(_) => Cv::Text(format!("<decode error: {}>", ty.name())),
+            }
         };
     }
     match ty {
-        Type::BOOL => get!(bool).map(Cv::Bool).unwrap_or(Cv::Null),
-        Type::INT2 => get!(i16).map(|v| Cv::from(v as i64)).unwrap_or(Cv::Null),
-        Type::INT4 => get!(i32).map(|v| Cv::from(v as i64)).unwrap_or(Cv::Null),
-        Type::INT8 => get!(i64).map(Cv::from).unwrap_or(Cv::Null),
-        Type::FLOAT4 => get!(f32).map(|v| Cv::Float(v as f64)).unwrap_or(Cv::Null),
-        Type::FLOAT8 => get!(f64).map(Cv::Float).unwrap_or(Cv::Null),
+        Type::BOOL => get!(bool, Cv::Bool),
+        Type::INT2 => get!(i16, |v: i16| Cv::from(v as i64)),
+        Type::INT4 => get!(i32, |v: i32| Cv::from(v as i64)),
+        Type::INT8 => get!(i64, Cv::from),
+        Type::FLOAT4 => get!(f32, |v: f32| Cv::Float(v as f64)),
+        Type::FLOAT8 => get!(f64, Cv::Float),
         Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME | Type::UNKNOWN => {
-            get!(String).map(Cv::Text).unwrap_or(Cv::Null)
+            get!(String, Cv::Text)
         }
-        Type::BYTEA => get!(Vec<u8>).map(Cv::Bytes).unwrap_or(Cv::Null),
+        Type::BYTEA => get!(Vec<u8>, Cv::Bytes),
         other => Cv::Text(format!("<unsupported pg type: {}>", other.name())),
     }
 }
@@ -109,4 +132,52 @@ pub fn rows_to_cbor(rows: &[Row], max_rows: usize) -> (Vec<Cv>, bool) {
         })
         .collect();
     (out, truncated)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::BytesMut;
+    use ciborium::value::Integer as CborInt;
+    use tokio_postgres::types::Type;
+
+    // CborInt::from only accepts up to i64/u64; build from i64 parts.
+    fn int_param(n: i64) -> PgParam {
+        PgParam(Cv::Integer(CborInt::from(n)))
+    }
+
+    fn int_param_big(n: u64) -> PgParam {
+        PgParam(Cv::Integer(CborInt::from(n)))
+    }
+
+    #[test]
+    fn int2_overflow_returns_err() {
+        // 99999 does not fit in i16 — must return Err, never silently wrap.
+        let param = int_param(99999);
+        let result = ToSql::to_sql(&param, &Type::INT2, &mut BytesMut::new());
+        assert!(result.is_err(), "expected Err for 99999 -> INT2, got Ok");
+    }
+
+    #[test]
+    fn int2_in_range_returns_ok() {
+        // 100 fits in i16 — must succeed.
+        let param = int_param(100);
+        let result = ToSql::to_sql(&param, &Type::INT2, &mut BytesMut::new());
+        assert!(result.is_ok(), "expected Ok for 100 -> INT2");
+    }
+
+    #[test]
+    fn int4_overflow_returns_err() {
+        let param = int_param(i64::from(i32::MAX) + 1);
+        let result = ToSql::to_sql(&param, &Type::INT4, &mut BytesMut::new());
+        assert!(result.is_err(), "expected Err for i32::MAX+1 -> INT4, got Ok");
+    }
+
+    #[test]
+    fn int8_overflow_returns_err() {
+        // i64::MAX + 1 can't be represented in i64, use u64 > i64::MAX.
+        let param = int_param_big(u64::from(u32::MAX) * u64::from(u32::MAX));
+        let result = ToSql::to_sql(&param, &Type::INT8, &mut BytesMut::new());
+        assert!(result.is_err(), "expected Err for large u64 -> INT8, got Ok");
+    }
 }
