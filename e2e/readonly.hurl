@@ -14,6 +14,14 @@ HTTP 403
 jsonpath "$.error.kind" == "std:capability-denied"
 jsonpath "$.error.message" contains "db:ddl"
 
+# Prove the rejected DDL had NO side effect: the table must not exist.
+# (BOOL expression, since regclass is not a decoded type.)
+POST {{baseurl}}/tools/query
+{"arguments": {"sql": "SELECT to_regclass('public.should_not_exist') IS NULL AS missing"}}
+HTTP 200
+[Asserts]
+jsonpath "$.content[0].data.rows[0].missing" == true
+
 # Statement-stacking is rejected (single-statement guard) on the read path.
 # ACT-HTTP maps invalid-args -> HTTP 422.
 POST {{baseurl}}/tools/query

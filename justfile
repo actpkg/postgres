@@ -7,11 +7,11 @@ actbuild := env("ACT_BUILD", "npx @actcore/act-build")
 hurl := env("HURL", "hurl")
 # Random port for the e2e server, in a safe range: above the well-known/common
 # dev ports and below the Linux outbound ephemeral range (32768+).
-port := `shuf -i 10000-29999 -n 1`
+port := `shuf -i 10000-19999 -n 1`
 addr := "[::1]:" + port
 baseurl := "http://" + addr
-# Second server port for the read-only enforcement test.
-port2 := `shuf -i 10000-29999 -n 1`
+# Second server port for the read-only enforcement test (disjoint range from `port`).
+port2 := `shuf -i 20000-29999 -n 1`
 addr2 := "[::1]:" + port2
 baseurl2 := "http://" + addr2
 
@@ -43,14 +43,8 @@ test: pack
     trap "kill $PID $PID2 2>/dev/null || true; docker compose down -v" EXIT
     curl --retry 60 --retry-connrefused --retry-delay 1 -fsS -o /dev/null {{baseurl}}/info
     curl --retry 60 --retry-connrefused --retry-delay 1 -fsS -o /dev/null {{baseurl2}}/info
-    # hurl --test sorts files alphabetically; create test schema before the run
-    # so introspection/explain (e,i) can find act_e2e_users created in query_execute (q).
-    curl -fsS -X POST "{{baseurl}}/tools/execute" \
-      -H "Content-Type: application/json" \
-      -d '{"arguments":{"sql":"DROP TABLE IF EXISTS act_e2e_users"}}' -o /dev/null
-    curl -fsS -X POST "{{baseurl}}/tools/execute" \
-      -H "Content-Type: application/json" \
-      -d '{"arguments":{"sql":"CREATE TABLE act_e2e_users (id serial primary key, name text not null, age int)"}}' -o /dev/null
+    # Each e2e file is self-contained (creates its own table), so they are safe
+    # under hurl's default parallel --test execution — no shared setup needed.
     {{hurl}} --test --variable "baseurl={{baseurl}}" e2e/info.hurl e2e/list_tools.hurl e2e/query_execute.hurl e2e/introspection.hurl e2e/explain.hurl
     {{hurl}} --test --variable "baseurl={{baseurl2}}" e2e/readonly.hurl
 
