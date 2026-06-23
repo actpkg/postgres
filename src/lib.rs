@@ -1,6 +1,8 @@
 use act_sdk::prelude::*;
 use ciborium::value::Value as Cv;
 
+pub mod classify;
+
 mod conn;
 use conn::{Connection, SslMode};
 
