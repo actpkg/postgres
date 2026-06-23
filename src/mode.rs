@@ -2,10 +2,11 @@
 //! required Tier and checks it against the session mode. Pure + host-testable.
 
 use crate::classify::{required_tier, Tier};
+use schemars::JsonSchema;
 use serde::Deserialize;
 use std::fmt;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum Mode {
     #[default]

@@ -36,12 +36,45 @@ use tokio_rustls::TlsConnector;
 /// Whether to use TLS for the Postgres connection.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SslMode {
-    /// No TLS; plain TCP. Default.
+    /// No TLS; plain TCP.
     Disable,
-    /// Attempt TLS; fall back to plain if the server does not support it.
+    // v1: `prefer` attempts TLS without plaintext fallback (same as require);
+    // true prefer-fallback (reconnect-on-handshake-failure) is a follow-up.
+    /// Attempt TLS. v1: no plaintext fallback on failure.
     Prefer,
     /// Require TLS; fail if the server does not support it.
     Require,
+}
+
+// ── ConnConfig ────────────────────────────────────────────────────────────────
+//
+// A plain config struct used by Connection::open. Intentionally free of
+// SDK types so conn.rs does not depend on act_sdk or the component module.
+
+/// All parameters needed to open a Postgres connection. Built by lib.rs from
+/// the SDK `OpenArgs` and passed into `Connection::open`.
+pub struct ConnConfig {
+    /// Optional full DSN (e.g. `postgres://user:pass@host:5432/db?sslmode=require`).
+    /// When set the discrete fields below are ignored for Config building.
+    pub connection_string: Option<String>,
+    /// Server hostname or IP (used when `connection_string` is None).
+    pub host: Option<String>,
+    /// Server port (default 5432).
+    pub port: u16,
+    /// Login role.
+    pub user: Option<String>,
+    /// Password.
+    pub password: Option<String>,
+    /// Database name.
+    pub dbname: Option<String>,
+    /// TLS mode.
+    pub sslmode: SslMode,
+    /// Optional server-side statement timeout in milliseconds.
+    pub statement_timeout_ms: Option<u32>,
+    /// Capability mode for this session.
+    pub mode: crate::mode::Mode,
+    /// Default row cap.
+    pub max_rows: usize,
 }
 
 // ── v1: TLS without full cert verification — see CHANGELOG ──────────────────
@@ -198,87 +231,216 @@ impl tokio_postgres::tls::TlsConnect<TcpStream> for PgTlsConnect {
 pub struct Connection {
     rt: Runtime,
     client: Client,
+    mode: crate::mode::Mode,
+    max_rows: usize,
 }
 
 impl Connection {
-    pub fn open(
-        host: &str,
-        port: u16,
-        user: &str,
-        password: Option<&str>,
-        dbname: &str,
-        sslmode: SslMode,
-    ) -> Result<Connection, String> {
+    /// Open a Postgres connection from a [`ConnConfig`].
+    ///
+    /// Config building:
+    /// - If `cfg.connection_string` is set, parse it into a `tokio_postgres::Config`
+    ///   (DSN form); discrete fields are ignored.
+    /// - Otherwise build a `tokio_postgres::Config` from the discrete fields.
+    ///
+    /// After connecting, run `SET statement_timeout = <ms>` if requested.
+    pub fn open(cfg: ConnConfig) -> Result<Connection, String> {
+        // ── Build tokio_postgres::Config ──────────────────────────────────────
+        let pg_cfg: tokio_postgres::Config = if let Some(ref dsn) = cfg.connection_string {
+            dsn.parse::<tokio_postgres::Config>()
+                .map_err(|e| format!("invalid connection_string: {e}"))?
+        } else {
+            let mut c = tokio_postgres::Config::new();
+            if let Some(ref h) = cfg.host {
+                c.host(h.as_str());
+            }
+            c.port(cfg.port);
+            if let Some(ref u) = cfg.user {
+                c.user(u.as_str());
+            }
+            if let Some(ref pw) = cfg.password {
+                c.password(pw.as_str());
+            }
+            if let Some(ref db) = cfg.dbname {
+                c.dbname(db.as_str());
+            }
+            c
+        };
+
+        // Extract host for DNS resolution + TLS SNI. We need the host before
+        // entering the async runtime (std DNS resolution via getaddrinfo).
+        let host: String = pg_cfg
+            .get_hosts()
+            .iter()
+            .find_map(|h| {
+                if let tokio_postgres::config::Host::Tcp(s) = h {
+                    Some(s.clone())
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| "no TCP host specified in connection config".to_string())?;
+
+        let port: u16 = pg_cfg.get_ports().first().copied().unwrap_or(5432);
+
         // Resolve host:port to a SocketAddr OUTSIDE the async runtime. tokio's
         // lookup_host is not yet wired on wasip2, so we resolve via std
-        // (getaddrinfo -> wasi:sockets ip-name-lookup) and hand tokio a concrete
+        // (getaddrinfo → wasi:sockets ip-name-lookup) and hand tokio a concrete
         // SocketAddr (which never triggers lookup_host).
-        let addr = (host, port)
+        let addr = (host.as_str(), port)
             .to_socket_addrs()
             .map_err(|e| format!("resolve {host}:{port} failed: {e}"))?
             .next()
             .ok_or_else(|| format!("no address for {host}:{port}"))?;
+
+        let sslmode = cfg.sslmode;
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| format!("tokio runtime build failed: {e}"))?;
 
-        let mut cfg = tokio_postgres::Config::new();
-        cfg.user(user).dbname(dbname).host(host);
-        if let Some(pw) = password {
-            cfg.password(pw);
-        }
+        let statement_timeout_ms = cfg.statement_timeout_ms;
 
-        let host_owned = host.to_owned();
         let client = rt.block_on(async move {
             let stream = tokio::net::TcpStream::connect(addr)
                 .await
                 .map_err(|e| format!("tcp connect {addr} failed: {e}"))?;
 
-            match sslmode {
+            let client = match sslmode {
                 SslMode::Disable => {
-                    let (client, connection) = cfg
+                    let (client, connection) = pg_cfg
                         .connect_raw(stream, NoTls)
                         .await
                         .map_err(|e| format!("postgres handshake failed: {e}"))?;
                     tokio::spawn(async move {
                         let _ = connection.await;
                     });
-                    Ok::<Client, String>(client)
+                    client
                 }
+                // v1: `prefer` attempts TLS without plaintext fallback (same as
+                // require); true prefer-fallback (reconnect on handshake failure)
+                // is a follow-up milestone.
                 SslMode::Prefer | SslMode::Require => {
                     let tls_cfg = rustls_config()?;
                     let connector = TlsConnector::from(Arc::new(tls_cfg));
                     let domain: ServerName<'static> =
-                        ServerName::try_from(host_owned.as_str())
-                            .map_err(|e| format!("invalid hostname for TLS SNI '{host_owned}': {e}"))?
+                        ServerName::try_from(host.as_str())
+                            .map_err(|e| {
+                                format!("invalid hostname for TLS SNI '{host}': {e}")
+                            })?
                             .to_owned();
                     let tls_connect = PgTlsConnect { connector, domain };
-                    let (client, connection) = cfg
+                    let (client, connection) = pg_cfg
                         .connect_raw(stream, tls_connect)
                         .await
                         .map_err(|e| format!("postgres TLS handshake failed: {e}"))?;
                     tokio::spawn(async move {
                         let _ = connection.await;
                     });
-                    Ok::<Client, String>(client)
+                    client
                 }
+            };
+
+            // Apply server-side statement timeout if requested.
+            if let Some(ms) = statement_timeout_ms {
+                client
+                    .batch_execute(&format!("SET statement_timeout = {ms}"))
+                    .await
+                    .map_err(|e| format!("SET statement_timeout failed: {e}"))?;
             }
+
+            Ok::<Client, String>(client)
         })?;
 
-        Ok(Connection { rt, client })
+        Ok(Connection {
+            rt,
+            client,
+            mode: cfg.mode,
+            max_rows: cfg.max_rows,
+        })
     }
 
-    pub fn select_scalar_i64(&self, sql: &str) -> Result<i64, String> {
+    /// The capability mode this session was opened with.
+    pub fn mode(&self) -> crate::mode::Mode {
+        self.mode
+    }
+
+    /// The default row cap configured at session open time.
+    pub fn default_max_rows(&self) -> usize {
+        self.max_rows
+    }
+
+    // ── Query methods ─────────────────────────────────────────────────────────
+
+    /// Execute a read-only query and return CBOR rows, capped at `max_rows`.
+    ///
+    /// The query is wrapped in an explicit `BEGIN; SET TRANSACTION READ ONLY;
+    /// ... COMMIT;` for defense-in-depth (in addition to the statement-tier
+    /// classification gate in `mode.rs`). The transaction is always committed
+    /// or rolled back, even if the query fails.
+    pub fn query_rows(
+        &self,
+        sql: &str,
+        params: &[crate::convert::PgParam],
+        max_rows: usize,
+    ) -> Result<(Vec<ciborium::value::Value>, bool), String> {
+        let refs = crate::convert::param_refs(params);
         self.rt.block_on(async {
-            let row = self
-                .client
-                .query_one(sql, &[])
+            // Read path hardening: a read-only transaction in addition to the
+            // statement classification (defense-in-depth vs statement-stacking).
+            self.client
+                .batch_execute("BEGIN; SET TRANSACTION READ ONLY;")
                 .await
-                .map_err(|e| format!("query failed: {e}"))?;
-            let v: i32 = row.get(0);
-            Ok(v as i64)
+                .map_err(|e| format!("begin read-only txn: {e}"))?;
+            let result = self.client.query(sql, &refs).await;
+            // Always end the txn, even on error.
+            let _ = self.client.batch_execute("COMMIT;").await;
+            let rows = result.map_err(|e| format!("query failed: {e}"))?;
+            Ok(crate::convert::rows_to_cbor(&rows, max_rows))
+        })
+    }
+
+    /// Execute a DML/DDL statement and return the number of affected rows.
+    pub fn execute_sql(
+        &self,
+        sql: &str,
+        params: &[crate::convert::PgParam],
+    ) -> Result<u64, String> {
+        let refs = crate::convert::param_refs(params);
+        self.rt.block_on(async {
+            self.client
+                .execute(sql, &refs)
+                .await
+                .map_err(|e| format!("execute failed: {e}"))
+        })
+    }
+
+    /// Run EXPLAIN (optionally with ANALYZE) on a SQL statement, returning
+    /// the plan as CBOR rows. Supports TEXT and JSON output formats.
+    pub fn explain(
+        &self,
+        sql: &str,
+        analyze: bool,
+        format: &str,
+    ) -> Result<Vec<ciborium::value::Value>, String> {
+        let kw = if analyze {
+            "EXPLAIN (ANALYZE, FORMAT "
+        } else {
+            "EXPLAIN (FORMAT "
+        };
+        let fmt = match format.to_ascii_lowercase().as_str() {
+            "json" => "JSON",
+            _ => "TEXT",
+        };
+        let stmt = format!("{kw}{fmt}) {sql}");
+        self.rt.block_on(async {
+            let rows = self
+                .client
+                .query(&stmt, &[])
+                .await
+                .map_err(|e| format!("explain failed: {e}"))?;
+            Ok(crate::convert::rows_to_cbor(&rows, usize::MAX).0)
         })
     }
 }
