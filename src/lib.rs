@@ -210,6 +210,9 @@ mod component {
                        WHERE schema_name NOT IN ('pg_catalog','information_schema') \
                        AND schema_name NOT LIKE 'pg_toast%' AND schema_name NOT LIKE 'pg_temp%' \
                        ORDER BY schema_name";
+            // Catalog reads are always db:read; gate for consistency with query/execute
+            // (and so a future tightening of read access is enforced here too).
+            gate(c, sql)?;
             let (rows, _) = c
                 .query_rows(sql, &[], usize::MAX)
                 .map_err(ActError::internal)?;
@@ -231,6 +234,7 @@ mod component {
             let s = schema.unwrap_or_else(|| "public".to_string());
             let sql = "SELECT table_name, table_type FROM information_schema.tables \
                        WHERE table_schema = $1 ORDER BY table_name";
+            gate(c, sql)?;
             let (rows, _) = c
                 .query_rows(sql, &[convert::PgParam(Cv::Text(s))], usize::MAX)
                 .map_err(ActError::internal)?;
@@ -255,6 +259,7 @@ mod component {
             let sql = "SELECT column_name, data_type, is_nullable, column_default \
                        FROM information_schema.columns \
                        WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position";
+            gate(c, sql)?;
             let (rows, _) = c
                 .query_rows(
                     sql,
