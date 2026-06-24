@@ -4,7 +4,22 @@ name = "postgres"
 [std.capabilities."wasi:sockets"]
 description = "TCP connection to a PostgreSQL server."
 
+# host "*" and no `ports` key => any host, any port (omitting ports = any port).
 [[std.capabilities."wasi:sockets".allow]]
 host = "*"
-ports = [5432, 5433, 5434, 5435, 5436, 5437, 5438, 5439, 5440]
 protocols = ["tcp"]
+
+# Semantic operation tiers. Enforced in-component today (self-checked against the
+# session `mode`); host-enforced once the act:consent WIT lands. Declaring them
+# sets the forward-looking ceiling so `--grant`/`--deny db:drop` is meaningful.
+[std.capabilities."db:read"]
+description = "Read data (SELECT, EXPLAIN, SHOW, schema introspection)."
+
+[std.capabilities."db:write"]
+description = "Modify rows (INSERT, UPDATE, DELETE, MERGE, COPY ... FROM)."
+
+[std.capabilities."db:ddl"]
+description = "Change schema (CREATE, ALTER, GRANT, REVOKE, ...)."
+
+[std.capabilities."db:drop"]
+description = "Destructive operations (DROP, TRUNCATE)."
