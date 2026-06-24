@@ -84,8 +84,11 @@ pub struct ConnConfig {
 // connections to real Postgres instances (including self-signed dev setups).
 // Full chain verification is tracked for a follow-up milestone.
 //
-// Signature verification IS performed by the crypto provider so the TLS
-// handshake is still authenticated; only cert-chain trust is skipped.
+// Handshake signatures are checked by the crypto provider, but because the
+// certificate chain is NOT verified those signatures are validated against an
+// UNTRUSTED cert — so this gives confidentiality (encryption) only, with NO
+// server authentication and NO protection against an active MITM presenting
+// any certificate. Equivalent in spirit to libpq sslmode=require (not verify-*).
 
 #[derive(Debug)]
 struct NoCertVerification;
