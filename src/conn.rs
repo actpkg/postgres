@@ -328,12 +328,9 @@ impl Connection {
                 SslMode::Prefer | SslMode::Require => {
                     let tls_cfg = rustls_config()?;
                     let connector = TlsConnector::from(Arc::new(tls_cfg));
-                    let domain: ServerName<'static> =
-                        ServerName::try_from(host.as_str())
-                            .map_err(|e| {
-                                format!("invalid hostname for TLS SNI '{host}': {e}")
-                            })?
-                            .to_owned();
+                    let domain: ServerName<'static> = ServerName::try_from(host.as_str())
+                        .map_err(|e| format!("invalid hostname for TLS SNI '{host}': {e}"))?
+                        .to_owned();
                     let tls_connect = PgTlsConnect { connector, domain };
                     let (client, connection) = pg_cfg
                         .connect_raw(stream, tls_connect)

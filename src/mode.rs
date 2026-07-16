@@ -1,7 +1,7 @@
 //! Session capability tier (`mode`) + the gate that maps a SQL string to its
 //! required Tier and checks it against the session mode. Pure + host-testable.
 
-use crate::classify::{required_tier, Tier};
+use crate::classify::{Tier, required_tier};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::fmt;
@@ -123,6 +123,9 @@ mod tests {
     }
     #[test]
     fn gate_allows_read_in_read_only() {
-        assert_eq!(require_tier(Mode::ReadOnly, "SELECT 1").unwrap(), Tier::Read);
+        assert_eq!(
+            require_tier(Mode::ReadOnly, "SELECT 1").unwrap(),
+            Tier::Read
+        );
     }
 }

@@ -3,8 +3,8 @@
 use bytes::BytesMut;
 use ciborium::value::Value as Cv;
 use std::error::Error;
-use tokio_postgres::types::{to_sql_checked, IsNull, ToSql, Type};
 use tokio_postgres::Row;
+use tokio_postgres::types::{IsNull, ToSql, Type, to_sql_checked};
 
 /// A dynamic SQL bind value. Wraps a CBOR value (host projects JSON/CBOR args
 /// into this). Supports the common scalar types; binds best-effort to the
@@ -170,7 +170,10 @@ mod tests {
     fn int4_overflow_returns_err() {
         let param = int_param(i64::from(i32::MAX) + 1);
         let result = ToSql::to_sql(&param, &Type::INT4, &mut BytesMut::new());
-        assert!(result.is_err(), "expected Err for i32::MAX+1 -> INT4, got Ok");
+        assert!(
+            result.is_err(),
+            "expected Err for i32::MAX+1 -> INT4, got Ok"
+        );
     }
 
     #[test]
@@ -178,6 +181,9 @@ mod tests {
         // i64::MAX + 1 can't be represented in i64, use u64 > i64::MAX.
         let param = int_param_big(u64::from(u32::MAX) * u64::from(u32::MAX));
         let result = ToSql::to_sql(&param, &Type::INT8, &mut BytesMut::new());
-        assert!(result.is_err(), "expected Err for large u64 -> INT8, got Ok");
+        assert!(
+            result.is_err(),
+            "expected Err for large u64 -> INT8, got Ok"
+        );
     }
 }

@@ -199,10 +199,7 @@ mod component {
         })
     }
 
-    #[act_tool(
-        description = "List non-system schemas in the database.",
-        read_only
-    )]
+    #[act_tool(description = "List non-system schemas in the database.", read_only)]
     fn list_schemas(ctx: &mut ActContext<ToolMeta>) -> ActResult<Cv> {
         let id = require_session(ctx)?;
         with_session(&id, |c| {
