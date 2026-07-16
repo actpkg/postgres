@@ -17,7 +17,7 @@ bytes = "1"
 ciborium = "0.2"
 tokio = { version = "1.51", features = ["rt", "net", "time", "macros"] }
 tokio-postgres = { version = "0.7", default-features = false }
-sqlparser = "0.52"
+sqlparser = "0.62"
 # TLS via pure-Rust provider (ring/aws-lc-rs do not build for wasm32-wasip2).
 # tokio-postgres-rustls is NOT used — it requires tokio-postgres's "runtime"
 # feature which fails to compile on wasm32-wasip2 (keepalive/socket2 breakage).
