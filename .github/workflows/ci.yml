@@ -55,9 +55,10 @@ jobs:
           path: target/wasm32-wasip2/release/
       - uses: moonrepo/setup-rust@v1
         with:
-          bins: just, hurl
+          bins: wkg, just, hurl
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - run: just init
       - run: just test
 
   publish:
@@ -76,10 +77,11 @@ jobs:
           path: target/wasm32-wasip2/release/
       - uses: moonrepo/setup-rust@v1
         with:
-          bins: just
+          bins: wkg, just
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - uses: sigstore/cosign-installer@v4.1.2   # defaults to cosign 3.x → OCI 1.1 referrer signatures
+      - run: just init
       - name: Publish
         id: publish
         env:
