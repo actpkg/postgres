@@ -4,9 +4,13 @@ name = "postgres"
 [std.capabilities."wasi:sockets"]
 description = "TCP connection to a PostgreSQL server."
 
-# host "*" and no `ports` key => any host, any port (omitting ports = any port).
+# host "*" => any host; bounded to the common PostgreSQL ports: 5432 (default),
+# 5433/5434 (additional local instances), 6432 (PgBouncer). A concrete port ceiling
+# is more in keeping with ACT's capability model than "any port"; extend the list
+# via a `--grant` override if a deployment needs a non-standard port.
 [[std.capabilities."wasi:sockets".allow]]
 host = "*"
+ports = [5432, 5433, 5434, 6432]
 protocols = ["tcp"]
 
 # Semantic operation tiers. Enforced in-component today (self-checked against the
