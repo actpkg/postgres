@@ -2,6 +2,14 @@
 
 All notable changes to this component are documented here.
 
+## [0.1.3] - 2026-08-11
+
+### Changed
+
+- Drop the `wit-bindgen` dependency. `act-sdk` 0.14 generates the WIT bindings
+  through its own copy of the runtime, so the component only depends on
+  `act-sdk`. No behaviour change; the compiled wasm moves to wit-bindgen 0.60.
+
 ## [0.1.0] - 2026-06-24
 
 Initial release. A hardened PostgreSQL tool component for ACT: connects to a
