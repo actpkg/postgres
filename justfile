@@ -4,16 +4,6 @@ component_ref := env("OCI_REF", "actpkg.dev/library/postgres")
 
 act := env("ACT", "npx @actcore/act")
 actbuild := env("ACT_BUILD", "npx @actcore/act-build")
-hurl := env("HURL", "hurl")
-# Random port for the e2e server, in a safe range: above the well-known/common
-# dev ports and below the Linux outbound ephemeral range (32768+).
-port := `shuf -i 10000-19999 -n 1`
-addr := "[::1]:" + port
-baseurl := "http://" + addr
-# Second server port for the read-only enforcement test (disjoint range from `port`).
-port2 := `shuf -i 20000-29999 -n 1`
-addr2 := "[::1]:" + port2
-baseurl2 := "http://" + addr2
 
 # Fetch WIT deps from the registry (ghcr.io/actcore) into wit/deps/.
 # wkg-registry.toml maps the act namespace -> actcore.dev (well-known -> ghcr.io/actcore).
@@ -40,19 +30,8 @@ test: build
     #!/usr/bin/env bash
     set -euo pipefail
     docker compose up -d --wait
-    SA_FULL='{"host":"127.0.0.1","port":5434,"user":"postgres","password":"postgres","dbname":"postgres","sslmode":"disable","mode":"full"}'
-    SA_RO='{"host":"127.0.0.1","port":5434,"user":"postgres","password":"postgres","dbname":"postgres","sslmode":"disable","mode":"read-only"}'
-    {{act}} run {{wasm}} --http --listen "{{addr}}" --allow wasi:sockets --session-args "$SA_FULL" &
-    PID=$!
-    {{act}} run {{wasm}} --http --listen "{{addr2}}" --allow wasi:sockets --session-args "$SA_RO" &
-    PID2=$!
-    trap "kill $PID $PID2 2>/dev/null || true; docker compose down -v" EXIT
-    curl --retry 60 --retry-connrefused --retry-delay 1 -fsS -o /dev/null {{baseurl}}/info
-    curl --retry 60 --retry-connrefused --retry-delay 1 -fsS -o /dev/null {{baseurl2}}/info
-    # Each e2e file is self-contained (creates its own table), so they are safe
-    # under hurl's default parallel --test execution — no shared setup needed.
-    {{hurl}} --test --variable "baseurl={{baseurl}}" e2e/info.hurl e2e/list_tools.hurl e2e/query_execute.hurl e2e/introspection.hurl e2e/explain.hurl
-    {{hurl}} --test --variable "baseurl={{baseurl2}}" e2e/readonly.hurl
+    trap "docker compose down -v" EXIT
+    ACT="{{act}}" uv run --project e2e pytest e2e/ -v
 
 publish: build
     #!/usr/bin/env bash

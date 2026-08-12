@@ -1,2 +1,6 @@
 target/
 wit/deps/
+__pycache__/
+.pytest_cache/
+.pytest-act-stderr.log
+.venv/

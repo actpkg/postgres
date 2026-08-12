@@ -55,9 +55,10 @@ jobs:
           path: target/wasm32-wasip2/release/
       - uses: moonrepo/setup-rust@v1
         with:
-          bins: wkg, just, hurl
+          bins: wkg, just
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: astral-sh/setup-uv@v6
       - run: just init
       - run: just test
 
