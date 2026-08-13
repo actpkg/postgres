@@ -1,0 +1,15 @@
+[package]
+name = "e2e-postgres"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Detach from any outer workspace this component may sit in.
+[workspace]
+
+[dev-dependencies]
+rmcp = { version = "3.5", features = ["client", "transport-child-process"] }
+# `net` is for the PostgreSQL reachability probe (TcpStream), the analogue of
+# the python conftest's `postgres_up` fixture.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "sync", "time", "net"] }
+serde_json = "1"
