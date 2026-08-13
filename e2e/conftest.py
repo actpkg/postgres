@@ -3,6 +3,15 @@
 The suite drives the packed component through `act run --mcp` over stdio with
 a real MCP client, so what the tests observe is what an agent observes.
 
+`postgres` is a session-provider whose credential is NOT a session argument:
+the password is fetched from the host credential store on the first tool
+call, because `get-secret` needs a session the host has already marked live
+and it does that only after `open-session` returns (ACT-AUTH §1.1.4). Two
+things follow for this suite, and both are load-bearing: the host needs
+`--allow act:credentials` and a `--credentials-backend` (see the
+`credential_store` fixture), and a connection failure now surfaces on the
+first tool call rather than at `open_session`.
+
 `postgres` is a session-provider. The old suite pre-opened one session per
 host process via `act run --session-args ...` — two processes, one per
 capability tier (`mode=full` and `mode=read-only`). That pattern is what is
@@ -50,17 +59,24 @@ LOG_FILE = Path(".pytest-act-stderr.log")
 CONNECT_TIMEOUT = 120
 
 # Matches compose.yaml: postgres:16, container port 5432 published on the
-# host as 5434, POSTGRES_PASSWORD=postgres (the image's default user and
-# database are both "postgres"). sslmode=disable: the container has no TLS
-# certificate configured.
+# host as 5434 (the image's default user and database are both "postgres").
+# sslmode=disable: the container has no TLS certificate configured.
+#
+# **No password.** These are session arguments, which are plaintext in the
+# agent's context and in the host's session record; the password lives in the
+# credential store the `credential_store` fixture provisions, and the
+# component fetches it on its first tool call.
 PG_CONN = {
     "host": "127.0.0.1",
     "port": 5434,
     "user": "postgres",
-    "password": "postgres",
     "dbname": "postgres",
     "sslmode": "disable",
 }
+
+# What compose.yaml sets POSTGRES_PASSWORD to, and therefore what goes into
+# the store rather than into PG_CONN.
+PG_PASSWORD = "postgres"
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -126,12 +142,63 @@ def wasm_path(act_command: list[str]) -> Path:
 
 
 @pytest.fixture
-async def client(act_command: list[str], wasm_path: Path):
+def pg_conn() -> dict:
+    """A fresh copy of the connection arguments, for tests that vary one.
+
+    A fixture rather than an import from `conftest`: that import only
+    resolves when the test directory happens to be on `sys.path`, which is
+    not something to rely on.
+    """
+    return dict(PG_CONN)
+
+
+@pytest.fixture(scope="session")
+def credential_store(act_command: list[str], wasm_path: Path, tmp_path_factory) -> str:
+    """A `--credentials-backend` argument naming a store that holds the
+    container's password under the key the component looks for by default.
+
+    Naming the field is not optional: `act secret set` has no default field
+    set — a credential IS its named fields — which is what the component's own
+    error messages print.
+    """
+    # The only skip: this CLI has no credential store, so the feature under
+    # test does not exist here. Everything past this line is a regression.
+    probe = subprocess.run([*act_command, "secret", "--help"], capture_output=True, text=True)
+    if probe.returncode != 0:
+        pytest.skip("this `act` has no credential store (`act secret`); nothing to drive")
+
+    backend = f"file:{tmp_path_factory.mktemp('credentials')}"
+    written = subprocess.run(
+        [*act_command, "secret", "set", str(wasm_path), "--key", "default",
+         "--field", "postgres:password",
+         "--fields-stdin", "--credentials-backend", backend],
+        input=json.dumps({"postgres:password": PG_PASSWORD}),
+        capture_output=True, text=True,
+    )
+    if written.returncode != 0:
+        # **Not a skip.** The line above proved the subcommand exists, so a
+        # failure here is a store that broke rather than one that is absent,
+        # and skipping would turn the whole suite green while proving nothing.
+        pytest.fail(
+            "`act secret set` failed even though `act secret` exists, so the credential "
+            f"store is broken rather than missing:\n{written.stderr.strip()}"
+        )
+    return backend
+
+
+@pytest.fixture
+async def client(act_command: list[str], wasm_path: Path, credential_store: str):
     """An MCP client granted the component's full declared `wasi:sockets`
-    ceiling (act.toml allows any host on the standard PostgreSQL ports), with
-    no session pre-opened — see the module docstring for why. Every test
-    that needs a session opens its own via the virtual `open_session` tool,
-    through the `session_id`/`readonly_session_id` fixtures below.
+    ceiling (act.toml allows any host on the standard PostgreSQL ports) and
+    its credential store, with no session pre-opened — see the module
+    docstring for why. Every test that needs a session opens its own via the
+    virtual `open_session` tool, through the `session_id`/`readonly_session_id`
+    fixtures below.
+
+    `--allow act:credentials` is mandatory, not tidiness: the default policy
+    is ask-by-default, a headless run degrades `ask` to deny, and a denied
+    store makes every tool call fail with `std:credential-required` on its
+    first attempt to connect.
 
     Function-scoped, fresh process per test: the component holds live
     connections in a per-process session registry, so sharing one process
@@ -139,7 +206,9 @@ async def client(act_command: list[str], wasm_path: Path):
     """
     transport = StdioTransport(
         command=act_command[0],
-        args=[*act_command[1:], "run", str(wasm_path), "--mcp", "--allow", "wasi:sockets"],
+        args=[*act_command[1:], "run", str(wasm_path), "--mcp",
+              "--allow", "wasi:sockets", "--allow", "act:credentials",
+              "--credentials-backend", credential_store],
         keep_alive=False,
         log_file=LOG_FILE,
     )

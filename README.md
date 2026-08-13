@@ -9,9 +9,10 @@ bounded by design. Runs as a wasip2 WebAssembly component inside the
 `postgres` is not a thin SQL passthrough. Every tool call is subject to two independent
 security layers:
 
-1. **Host capability gate (`wasi:sockets`)** — the ACT host controls whether the
-   component can open any TCP connection at all. Deny `wasi:sockets` and no network
-   egress occurs, regardless of what the agent asks.
+1. **Host capability gate (`wasi:sockets`, `act:credentials`)** — the ACT host
+   controls whether the component can open any TCP connection at all, and whether it
+   may read a credential. Deny `wasi:sockets` and no network egress occurs,
+   regardless of what the agent asks.
 2. **SQL-tier gate (self-enforced, consent-WIT swap-point)** — the session `mode` arg
    sets a read/write/DDL/DROP ceiling. Each tool call classifies the incoming SQL and
    rejects it before the wire if it exceeds the ceiling. These tiers are declared in
@@ -25,21 +26,103 @@ security layers:
 
 | Capability | Meaning |
 |------------|---------|
-| `wasi:sockets` | TCP egress to any host / any port — host-gated |
+| `wasi:sockets` | TCP egress to any host on the standard PostgreSQL ports — host-gated |
+| `act:credentials` | Read the password from the host credential store — host-gated |
 | `db:read` | SELECT, EXPLAIN, schema introspection — self-enforced |
 | `db:write` | INSERT, UPDATE, DELETE, MERGE, COPY FROM — self-enforced |
 | `db:ddl` | CREATE, ALTER, GRANT, REVOKE — self-enforced |
 | `db:drop` | DROP, TRUNCATE — self-enforced |
+
+## The password is not an argument
+
+**postgres never accepts a password in its session arguments.** Everything sent to
+`open_session` is plaintext in the agent's context, in the transcript, and in the
+host's session record. The password lives in the host credential store instead, and
+the component fetches it over `act:credentials` — so it never passes through the
+agent at all.
+
+Provision it once:
+
+```bash
+# Prompts for the declared fields with no further arguments.
+act login postgres.wasm
+
+# Or non-interactively:
+echo '{"postgres:password":"..."}' | act secret set postgres.wasm \
+  --key default --field postgres:password --fields-stdin
+```
+
+| Field | Required | Meaning |
+|-------|----------|---------|
+| `postgres:password` | yes | The role's password. |
+| `postgres:user` | no | The role it belongs to — stored beside it so the pair rotates together. |
+
+The session names which credential to use with `credential_key` (default
+`"default"`), so one deployment can hold several: a read-only reporting role and a
+migration role, say.
+
+**Login role precedence:** the `user` session argument wins, then the DSN's `user=`,
+then the credential's `postgres:user`. The pairing is not checked and cannot be —
+only the server knows whether a role and a password go together — so a mismatch
+surfaces as an authentication failure on the first tool call.
+
+### What changed for `connection_string`
+
+A DSN mixes secret and non-secret in one opaque string, which makes it the nastier
+of the two leaks this component used to have: `password` at least looked like a
+credential, while `postgres://user:pass@host/db` reads as an address. So the DSN
+stays — it is how connection details are actually recorded — but **it must be
+password-free**, in every spelling:
+
+| Rejected | Why |
+|----------|-----|
+| `postgres://user:pass@host/db` | userinfo; refused whole, not just the `:pass` half |
+| `postgres://host/db?password=…` | same password, different slot |
+| `host=… password=…` | same again, keyword/value form |
+| any `@` in a URL-form DSN | tokio-postgres reads everything before the first `@` as userinfo, so `?application_name=job@1` would silently connect to host `1`. Write `%40`. |
+| a comma-separated host list | failover is not implemented, and connecting to the first host silently is worse than saying so |
+| `sslnegotiation=direct` | needs an ALPN protocol this build does not set |
+
+What a DSN *may* carry, and what happens to it:
+
+| Parameter | Fate |
+|-----------|------|
+| `host`, `port` | honoured (exactly one host, TCP only) |
+| `dbname`, `user` | honoured, and overridden by the `dbname` / `user` session args |
+| `sslmode` | honoured, and overridden by the `sslmode` session arg |
+| `options`, `application_name`, `channel_binding` | honoured, sent at startup |
+| `connect_timeout`, `keepalives*`, `tcp_user_timeout`, `target_session_attrs`, `load_balance_hosts`, `hostaddr` | ignored — they belong to tokio-postgres's `runtime` connector, which does not build for wasm32-wasip2 |
+
+Anything else is a parse error rather than a silent drop — including
+`sslmode=verify-full`, which tokio-postgres does not know (and see the TLS section
+for why there is no chain verification to ask for yet).
+
+`connection_string` and `host`/`port` are alternatives: pass one, not both.
+
+### The connection now opens on the first tool call
+
+`get-secret` requires a session the host has already marked live, and the host does
+that only after `open-session` returns (ACT-AUTH §1.1.4) — so the credential cannot
+be fetched at open, and neither can the connection be made there. **A bad password,
+an unreachable server or a missing database therefore surfaces on the first tool
+call, not at `open_session`.** Everything decidable from the arguments alone is
+still decided at open, so an argument mistake is still reported where it was made.
+
+An authentication failure (SQLSTATE class 28) poisons the session: subsequent calls
+are refused without asking the store again, which on an interactive host would mean
+another consent prompt for a credential already known to be wrong. Transport
+failures are retried, because those change on their own.
 
 ## Quick start
 
 ### One-shot call
 
 ```bash
-# Open a session-of-1 and run a single query.
+# Open a session-of-1 and run a single query. No password anywhere: it comes
+# from the credential store provisioned above.
 act call postgres.wasm query \
-  --session-args '{"host":"localhost","user":"postgres","password":"secret","dbname":"mydb"}' \
-  --allow wasi:sockets \
+  --session-args '{"host":"localhost","user":"postgres","dbname":"mydb"}' \
+  --allow wasi:sockets --allow act:credentials \
   --args '{"sql":"SELECT version()"}'
 ```
 
@@ -47,20 +130,26 @@ act call postgres.wasm query \
 
 ```bash
 # Serve over MCP stdio — agents open/close sessions themselves.
-act run postgres.wasm --mcp --allow wasi:sockets
+act run postgres.wasm --mcp --allow wasi:sockets --allow act:credentials
 ```
 
-### HTTP server
+### MCP over Streamable HTTP
 
 ```bash
-act run postgres.wasm --http -l [::1]:3000 --allow wasi:sockets
+act run postgres.wasm --mcp --http -l [::1]:3000 \
+  --allow wasi:sockets --allow act:credentials
 ```
 
 ### Scoped grant (restrict to one host)
 
+Worth doing whenever the credential store is granted: `--allow wasi:sockets` opens
+the component's whole declared ceiling, which is every host on the standard
+PostgreSQL ports — so an allowlist is the only bound you have chosen yourself on
+where a credential could be sent. The host warns about exactly this combination.
+
 ```bash
-act run postgres.wasm --mcp \
-  --grant '{"wasi:sockets":{"mode":"allowlist","allow":[{"host":"db.internal","protocols":["tcp"]}]}}'
+act run postgres.wasm --mcp --allow act:credentials \
+  --grant '{"wasi:sockets":{"mode":"allowlist","allow":[{"host":"db.internal","ports":[5432],"protocols":["tcp"]}]}}'
 ```
 
 ### Restrict to read-only (default, but explicit)
@@ -72,17 +161,22 @@ rejected before reaching the server:
 { "host": "db.example.com", "user": "ro_user", "dbname": "prod", "mode": "read-only" }
 ```
 
+(Still no password — `credential_key` defaults to `"default"`.)
+
 ## Session open args
+
+There is no `password`, and there never will be — see "The password is not an
+argument" above.
 
 | Arg | Type | Default | Notes |
 |-----|------|---------|-------|
-| `connection_string` | string? | — | Full DSN (`postgres://user:pass@host:5432/db`). When set, discrete fields are ignored. |
-| `host` | string? | — | Hostname or IP. |
-| `port` | integer | 5432 | Server port. |
-| `user` | string? | — | Login role. |
-| `password` | string? | — | Password. |
-| `dbname` | string? | — | Database name. |
-| `sslmode` | `disable`\|`prefer`\|`require` | `prefer` | TLS mode — see TLS section below. |
+| `connection_string` | string? | — | **Password-free** DSN (`postgres://host:5432/db?…`). Alternative to `host`/`port`. |
+| `host` | string? | — | Hostname or IP. Alternative to `connection_string`. |
+| `port` | integer? | 5432 | Server port. Only with `host`. |
+| `user` | string? | — | Login role. Overrides the DSN's `user=` and the credential's `postgres:user`. |
+| `credential_key` | string | `default` | Which credential in this component's profile to authenticate with. |
+| `dbname` | string? | — | Database name. Overrides the DSN's `dbname=`. |
+| `sslmode` | `disable`\|`prefer`\|`require`? | DSN's, else `prefer` | TLS mode — see TLS section below. |
 | `mode` | `read-only`\|`read-write`\|`ddl`\|`full` | `read-only` | SQL operation ceiling. |
 | `max_rows` | integer | 1000 | Default row cap for `query`. |
 | `statement_timeout_ms` | integer? | — | Server-side statement timeout. |
@@ -201,8 +295,11 @@ Additional v1 TLS notes:
 - `sslmode=prefer` and `sslmode=require` behave identically — both attempt TLS with
   no plaintext fallback.
 - `sslmode=disable` skips TLS entirely (plain TCP).
-- When `connection_string` is used, any `?sslmode=...` inside the DSN is ignored;
-  the top-level `sslmode` arg (default `prefer`) controls transport.
+- A DSN's `?sslmode=...` **is** honoured, and the `sslmode` session arg overrides it.
+  (It used to be parsed and then ignored, which meant a DSN saying `sslmode=disable`
+  connected in the clear even when the session arg said `require` — `connect_raw`
+  reads `ssl_mode` itself and returns a plaintext stream for `disable` whatever
+  connector it is handed.)
 
 ## Development
 
@@ -213,8 +310,11 @@ just pack   # embed act:component metadata
 just test   # run e2e tests (requires Docker for postgres:16)
 ```
 
-The e2e suite starts a `postgres:16` container via Docker Compose, runs hurl tests
-against an HTTP server, and tears down automatically.
+The e2e suite starts a `postgres:16` container via Docker Compose, drives the packed
+component through `act run --mcp` with a real MCP client, and tears down
+automatically. It provisions the container's password into a temporary file-backed
+credential store (`act secret set --credentials-backend file:…`) and grants the host
+`--allow act:credentials`, because a headless run degrades ask-by-default to deny.
 
 Use the locally-rebuilt binaries when repacking (the released `act-build` does not
 yet support the any-port sockets ceiling declaration):

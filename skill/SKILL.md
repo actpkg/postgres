@@ -12,23 +12,59 @@ then call SQL tools. Network egress is gated by the host (`wasi:sockets`); SQL
 operations are gated by the session `mode` tier (`read-only` | `read-write` | `ddl`
 | `full`, default `read-only`).
 
+## Never send a password
+
+**There is no password argument, and you must not try to supply one.** The password
+comes from the host credential store over `act:credentials`, so it never enters your
+context. A session names *which* credential to use — `credential_key`, default
+`"default"` — and nothing more.
+
+A `connection_string` carrying a password in any spelling
+(`postgres://user:pass@host/db`, `?password=…`, `host=… password=…`) is refused at
+open, as is a `host` carrying userinfo. If you have been handed a DSN with a
+password in it, strip the password and tell the user to store it:
+
+```
+act login <component-ref>
+# or: echo '{"postgres:password":"..."}' | act secret set <component-ref> \
+#       --key default --field postgres:password --fields-stdin
+```
+
+The login role comes from the `user` argument, else the DSN's `user=`, else the
+credential's optional `postgres:user` field.
+
 ## Opening a session
 
 Call `open_session` with connection args. The session id is returned and must be
 passed as `std:session-id` metadata on every tool call.
 
+`connection_string` and `host`/`port` are alternatives — pass one, not both.
+
 | Arg | Type | Default | Notes |
 |-----|------|---------|-------|
-| `connection_string` | string? | — | Full DSN (`postgres://user:pass@host:5432/db`). When set, discrete fields below are ignored. `?sslmode=...` inside the DSN is also ignored — use the `sslmode` arg. |
-| `host` | string? | — | Hostname or IP (when not using `connection_string`). |
-| `port` | integer | 5432 | Server port. |
-| `user` | string? | — | Login role. |
-| `password` | string? | — | Password. |
-| `dbname` | string? | — | Database name. |
-| `sslmode` | `disable`\|`prefer`\|`require` | `prefer` | TLS mode. `prefer` and `require` both attempt TLS — see TLS notes below. |
+| `connection_string` | string? | — | **Password-free** DSN (`postgres://host:5432/db?sslmode=require`). Its `sslmode`, `dbname`, `user`, `options` and `application_name` are honoured; `connect_timeout`, `keepalives*` and `target_session_attrs` are ignored; a password, any `@` (write `%40`), a comma-separated host list and `sslnegotiation=direct` are refused. |
+| `host` | string? | — | Hostname or IP. No port, no userinfo, no scheme. |
+| `port` | integer? | 5432 | Server port. Only with `host`. |
+| `user` | string? | — | Login role. Overrides the DSN's `user=` and the credential's `postgres:user`. |
+| `credential_key` | string | `default` | Which stored credential to authenticate with. A bounded name: letters, digits, `-`, `_`, `.` |
+| `dbname` | string? | — | Database name. Overrides the DSN's `dbname=`. |
+| `sslmode` | `disable`\|`prefer`\|`require`? | DSN's, else `prefer` | TLS mode. `prefer` and `require` both attempt TLS — see TLS notes below. |
 | `mode` | `read-only`\|`read-write`\|`ddl`\|`full` | `read-only` | Operation tier for this session. |
 | `max_rows` | integer | 1000 | Default row cap for `query`. |
 | `statement_timeout_ms` | integer? | — | Server-side timeout per statement. |
+
+**`open_session` does not connect.** The credential cannot be fetched until the
+session is live, so the connection is made on your first tool call. A wrong
+password, an unreachable host or a missing database is reported there, not at open.
+Argument mistakes are still reported at open.
+
+## Errors worth recognising
+
+| Kind | What to do |
+|------|-----------|
+| `std:credential-required` | No usable credential, or the server rejected it. Do **not** retry and do **not** offer to pass the password as an argument — surface the `act secret set` command in the message to the user. Once the server has rejected a credential the session is poisoned; a fixed credential needs a new session. |
+| `std:capability-denied` | The statement exceeds the session `mode`, or the host denied a capability. Open a session at a higher tier only if the user asks for one. |
+| `std:invalid-args` | An argument was wrong — including a password found in `connection_string` or `host`. |
 
 ## Mode tiers
 

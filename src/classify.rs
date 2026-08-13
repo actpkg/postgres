@@ -48,7 +48,24 @@ fn classify_one(stmt: &Statement) -> Tier {
         | Statement::Merge { .. }
         | Statement::Copy { .. } => Tier::Write,
 
-        Statement::Drop { .. } | Statement::Truncate { .. } => Tier::Drop,
+        // Every DROP form, not just `Statement::Drop`: sqlparser gives some
+        // object kinds a variant of their own, and one that fell through to
+        // the catch-all below would let a `db:ddl` session run e.g.
+        // `DROP EXTENSION ... CASCADE`. Listed exhaustively rather than
+        // matched by name so a sqlparser bump that adds one fails review here.
+        Statement::Drop { .. }
+        | Statement::DropConnector { .. }
+        | Statement::DropDomain(_)
+        | Statement::DropExtension(_)
+        | Statement::DropFunction(_)
+        | Statement::DropOperator(_)
+        | Statement::DropOperatorClass(_)
+        | Statement::DropOperatorFamily(_)
+        | Statement::DropPolicy(_)
+        | Statement::DropProcedure { .. }
+        | Statement::DropSecret { .. }
+        | Statement::DropTrigger(_)
+        | Statement::Truncate { .. } => Tier::Drop,
 
         // Everything else that mutates structure/permissions is DDL.
         _ => Tier::Ddl,
@@ -108,6 +125,24 @@ mod tests {
     fn drops() {
         assert_eq!(t("DROP TABLE t"), Tier::Drop);
         assert_eq!(t("TRUNCATE t"), Tier::Drop);
+    }
+    /// DROP forms sqlparser parses into a variant other than
+    /// `Statement::Drop`. Each must still need `db:drop`, not `db:ddl`.
+    #[test]
+    fn every_drop_form_is_a_drop() {
+        for sql in [
+            "DROP FUNCTION f(int)",
+            "DROP PROCEDURE p",
+            "DROP TRIGGER tr ON t",
+            "DROP POLICY pol ON t",
+            "DROP EXTENSION pgcrypto CASCADE",
+            "DROP DOMAIN d",
+            "DROP OPERATOR + (int, int)",
+            "DROP OPERATOR FAMILY f USING btree",
+            "DROP OPERATOR CLASS c USING btree",
+        ] {
+            assert_eq!(t(sql), Tier::Drop, "{sql}");
+        }
     }
     #[test]
     fn max_over_batch() {

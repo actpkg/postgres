@@ -27,3 +27,32 @@ description = "Change schema (CREATE, ALTER, GRANT, REVOKE, ...)."
 
 [std.capabilities."db:drop"]
 description = "Destructive operations (DROP, TRUNCATE)."
+
+# Bare table: the class takes no parameters. An undeclared class is always
+# denied and no grant can widen it, so without this the component cannot reach
+# the credential store however it is run.
+[std.capabilities."act:credentials"]
+
+# Declared so `act login <ref>` prompts for the role and its password with zero
+# arguments. The field names live in this component's own namespace — a `std:`
+# key is refused at pack time, and ACT-CONSTANTS §8.2 registers field *types*,
+# not names.
+[[std.credentials]]
+# `default` is `DEFAULT_CREDENTIAL_KEY` in src/creds.rs — the key a session uses
+# when its args do not name one.
+key = "default"
+description = "PostgreSQL role and password"
+
+[[std.credentials.fields]]
+key = "postgres:password"
+label = "PostgreSQL password"
+
+# Optional and not secret: a role name is not credential material, and a
+# deployment may prefer to name the role in the session's `user` argument
+# instead. Storing it beside the password keeps a role and its password
+# together, which is how they are rotated.
+[[std.credentials.fields]]
+key = "postgres:user"
+label = "PostgreSQL role"
+secret = false
+required = false
