@@ -50,10 +50,7 @@ mod component {
     fn park(id: &str) {
         if let Some(state) = SESSIONS.remove(id) {
             if let Some(conn) = state.conn {
-                ZOMBIES
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(conn);
+                ZOMBIES.lock().unwrap_or_else(|e| e.into_inner()).push(conn);
             }
         }
     }
@@ -449,7 +446,9 @@ mod component {
     /// keeps a request the component was never going to be allowed to make
     /// from reaching a human as a consent prompt.
     fn gate(id: &str, sql: &str) -> ActResult<()> {
-        let mode = SESSIONS.with(id, |s| s.mode).ok_or_else(|| unknown_session(id))?;
+        let mode = SESSIONS
+            .with(id, |s| s.mode)
+            .ok_or_else(|| unknown_session(id))?;
         mode::require_tier(mode, sql)
             .map(|_| ())
             .map_err(|g: mode::GateError| ActError::capability_denied(g.summary))
