@@ -48,10 +48,10 @@ mod component {
     /// than a fiber we control, and leaking one socket per abandoned close is
     /// the price of never trapping.
     fn park(id: &str) {
-        if let Some(state) = SESSIONS.remove(id) {
-            if let Some(conn) = state.conn {
-                ZOMBIES.lock().unwrap_or_else(|e| e.into_inner()).push(conn);
-            }
+        if let Some(state) = SESSIONS.remove(id)
+            && let Some(conn) = state.conn
+        {
+            ZOMBIES.lock().unwrap_or_else(|e| e.into_inner()).push(conn);
         }
     }
 
