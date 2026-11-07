@@ -27,7 +27,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: component.wasm
-          path: target/wasm32-wasip2/release/*.wasm
+          path: target/wasm32-wasip3/release/*.wasm
 
   lint:
     name: Lint
@@ -52,13 +52,12 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: component.wasm
-          path: target/wasm32-wasip2/release/
+          path: target/wasm32-wasip3/release/
       - uses: moonrepo/setup-rust@v1
         with:
           bins: wkg, just
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - uses: astral-sh/setup-uv@v6
       - run: just init
       - run: just test
 
@@ -75,7 +74,7 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: component.wasm
-          path: target/wasm32-wasip2/release/
+          path: target/wasm32-wasip3/release/
       - uses: moonrepo/setup-rust@v1
         with:
           bins: wkg, just

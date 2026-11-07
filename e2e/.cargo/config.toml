@@ -1,6 +1,6 @@
 # This crate is host-only test code: it spawns `act` over tokio's process,
 # which does not exist on wasm. The component root's .cargo/config.toml
-# defaults every build in this tree to wasm32-wasip2 (`just build` relies on
+# defaults every build in this tree to wasm32-wasip3 (`just build` relies on
 # that), so pin the host target here — a nearer config file wins — and a bare
 # `cargo test` in e2e/ does the right thing.
 [build]

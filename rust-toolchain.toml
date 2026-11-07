@@ -1,4 +1,12 @@
+# 1.100.0-beta: wasm32-wasip3 tier 2 starting 1.100 (stable lands
+# 2026-11-12); pinned exact beta so the channel does not silently
+# move to 1.101.0-beta mid-stabilization. Revisit on the 1.100
+# release: either flip to stable "1.100.0" or follow the next beta
+# deliberately.
+# Precedent: mcp-bridge, openapi-bridge, search-brave,
+# search-searxng, search-yandex, scrape, dadata, bitrix24, onec,
+# iiko-server, anydoc.
 [toolchain]
-channel = "stable"
-targets = ["wasm32-wasip2"]
+channel = "1.100.0-beta"
+targets = ["wasm32-wasip3"]
 components = ["rustfmt", "clippy"]

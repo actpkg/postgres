@@ -1,14 +1,14 @@
 [package]
 name = "component-postgres"
 description = "Hardened PostgreSQL access for AI agents — capability-gated, tiered, bounded"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 keywords = ["act", "postgres", "postgresql", "sql", "wasm"]
 repository = "https://github.com/actpkg/postgres"
 
 [dependencies]
-act-sdk = "0.14.2"
+act-sdk = "0.14.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = "1"
@@ -16,10 +16,19 @@ bytes = "1"
 ciborium = "0.2"
 tokio = { version = "1.53", features = ["rt", "net", "time", "macros"] }
 tokio-postgres = { version = "0.7", default-features = false }
-sqlparser = "0.63"
-# TLS via pure-Rust provider (ring/aws-lc-rs do not build for wasm32-wasip2).
+# `default-features = false`: the default `recursive-protection` feature pulls
+# `recursive` -> `stacker` -> `psm`, whose wasm32 object carries globals for
+# thread context and fails to link under wasip3's `--cooperative-threading`
+# (rust-lld: "object file uses globals for thread context"). The protection
+# is a host-stack growth guard for deeply nested SQL — harmless to drop on
+# wasm, where the guard stack does not exist anyway; the parser recursion
+# limit itself still applies.
+sqlparser = { version = "0.63", default-features = false, features = ["std"] }
+# TLS via pure-Rust provider (ring/aws-lc-rs were observed not to build on
+# wasm32-wasip2 and are not retested on wasip3).
 # tokio-postgres-rustls is NOT used — it requires tokio-postgres's "runtime"
-# feature which fails to compile on wasm32-wasip2 (keepalive/socket2 breakage).
+# feature, whose keepalive/socket2 stack breaks on wasm32 (observed on
+# wasip2; socket2 has no wasip3 support either).
 # Instead we implement TlsConnect directly over tokio-rustls.
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "custom-provider"] }
 rustls-rustcrypto = { version = "0.0.2-alpha", default-features = false, features = ["std", "tls12"] }

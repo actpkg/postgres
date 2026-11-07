@@ -1,4 +1,4 @@
-wasm := "target/wasm32-wasip2/release/component_postgres.wasm"
+wasm := "target/wasm32-wasip3/release/component_postgres.wasm"
 # OCI reference to publish to (registry/namespace/name, no tag). Override with OCI_REF.
 component_ref := env("OCI_REF", "actpkg.dev/library/postgres")
 

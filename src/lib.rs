@@ -13,8 +13,62 @@ use conn::{ConnTarget, ConnectError, SslMode, TargetArgs};
 mod component {
     use super::*;
 
-    thread_local! {
-        static SESSIONS: SessionRegistry<SessionState> = SessionRegistry::new("postgres");
+    // A plain `static`, not `thread_local!`: under wasip3 every host fiber
+    // gets its own TLS, so a `thread_local` registry would be repopulated
+    // from scratch on every tool call and no session would survive between
+    // them. See the `act_sdk::sessions` module docs.
+    static SESSIONS: std::sync::LazyLock<SessionRegistry<SessionState>> =
+        std::sync::LazyLock::new(|| SessionRegistry::new("postgres"));
+
+    // Connections parked for teardown by `close`, drained by the next async
+    // export (see `drain_zombies`). A plain `static` with a `Mutex` for the
+    // same fiber reason as the registry above; the lock is uncontended in
+    // practice because fibers only switch at `.await` and no drain holds it
+    // across one.
+    static ZOMBIES: std::sync::LazyLock<std::sync::Mutex<Vec<conn::Connection>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+    /// Park a session's live connection for later teardown.
+    ///
+    /// `close-session` is a **synchronous** WIT export: it runs on a fiber
+    /// that has never awaited, and tearing a tokio runtime down from such a
+    /// fiber (cancel the driver task, whose drop path closes the TCP socket
+    /// through wasi:sockets) trap-fails under wasip3 cooperative threading —
+    /// observed as `std:internal` from `close-session` with a backtrace
+    /// through `tcp_free`. So `close` parks into [`ZOMBIES`] instead, and the
+    /// next **async** export drains the list via
+    /// [`conn::Connection::shutdown`], which runs the whole teardown inside
+    /// `block_on` on the connection's own runtime — the same context every
+    /// connection was created in, and one wasi:sockets accepts.
+    ///
+    /// A session-bound agent calls a tool after opening and again before any
+    /// further close, so in the common MCP flow a zombie lives for exactly
+    /// one tool call. One that is never drained lingers until the host drops
+    /// the instance; that socket is closed by the instance teardown rather
+    /// than a fiber we control, and leaking one socket per abandoned close is
+    /// the price of never trapping.
+    fn park(id: &str) {
+        if let Some(state) = SESSIONS.remove(id) {
+            if let Some(conn) = state.conn {
+                ZOMBIES
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(conn);
+            }
+        }
+    }
+
+    /// Tear down every parked connection. Called at the top of async exports
+    /// (currently `ensure_connection`); never from a sync export.
+    fn drain_zombies() {
+        let drained: Vec<_> = ZOMBIES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect();
+        for conn in drained {
+            conn.shutdown();
+        }
     }
 
     // ── OpenArgs ──────────────────────────────────────────────────────────────
@@ -170,23 +224,20 @@ mod component {
         })
         .map_err(ActError::invalid_args)?;
 
-        Ok(SESSIONS.with(|r| {
-            r.insert(SessionState {
-                target,
-                credential_key: args.credential_key,
-                mode: args.mode,
-                max_rows: args.max_rows as usize,
-                conn: None,
-                credential_rejected: false,
-            })
+        Ok(SESSIONS.insert(SessionState {
+            target,
+            credential_key: args.credential_key,
+            mode: args.mode,
+            max_rows: args.max_rows as usize,
+            conn: None,
+            credential_rejected: false,
         }))
     }
 
     #[session_close]
     fn close(session_id: String) {
-        SESSIONS.with(|r| {
-            r.remove(&session_id);
-        });
+        // Never tears down here: sync export, no async context (see `park`).
+        park(&session_id);
     }
 
     fn unknown_session(id: &str) -> ActError {
@@ -209,14 +260,12 @@ mod component {
         f: impl FnOnce(&SessionState, &conn::Connection) -> ActResult<T>,
     ) -> ActResult<T> {
         SESSIONS
-            .with(|r| {
-                r.with(id, |s| match s.conn.as_ref() {
-                    Some(c) => f(s, c),
-                    None => Err(ActError::internal(
-                        "the session has no connection; this call reached the database \
-                         layer without establishing one",
-                    )),
-                })
+            .with(id, |s| match s.conn.as_ref() {
+                Some(c) => f(s, c),
+                None => Err(ActError::internal(
+                    "the session has no connection; this call reached the database \
+                     layer without establishing one",
+                )),
             })
             .ok_or_else(|| unknown_session(id))?
     }
@@ -247,8 +296,12 @@ mod component {
     /// well-known (`ACT-CONSTANTS.md` §8 registers types, not names), so the
     /// component that reads a field is the party that asked for it.
     async fn ensure_connection(session_id: &str) -> ActResult<()> {
+        // An async export is the only place teardown is safe (see `park`);
+        // the head of the first tool call of this run is where zombies get
+        // their shutdown, before anything else in this call can fail.
+        drain_zombies();
         if SESSIONS
-            .with(|r| r.with(session_id, |s| s.conn.is_some()))
+            .with(session_id, |s| s.conn.is_some())
             .unwrap_or(false)
         {
             return Ok(());
@@ -259,7 +312,7 @@ mod component {
             return Err(e);
         }
         let (target, key) = SESSIONS
-            .with(|r| r.with(session_id, |s| (s.target.clone(), s.credential_key.clone())))
+            .with(session_id, |s| (s.target.clone(), s.credential_key.clone()))
             .ok_or_else(|| unknown_session(session_id))?;
 
         let raw = match act::credentials::store::get_secret(
@@ -280,10 +333,10 @@ mod component {
 
         match target.connect(&user, &credentials.password) {
             Ok(connection) => SESSIONS
-                .with(|r| r.with_mut(session_id, |s| s.conn = Some(connection)))
+                .with_mut(session_id, |s| s.conn = Some(connection))
                 .ok_or_else(|| unknown_session(session_id)),
             Err(ConnectError::Authentication(detail)) => {
-                SESSIONS.with(|r| r.with_mut(session_id, |s| s.credential_rejected = true));
+                SESSIONS.with_mut(session_id, |s| s.credential_rejected = true);
                 Err(ActError::new(
                     creds::ERR_CREDENTIAL_REQUIRED,
                     format!("{detail}\n{}", creds::credential_rejected_message(&key)),
@@ -313,10 +366,8 @@ mod component {
     /// implementation.
     fn poisoned(session_id: &str) -> Option<ActError> {
         SESSIONS
-            .with(|r| {
-                r.with(session_id, |s| {
-                    (s.credential_rejected, s.credential_key.clone())
-                })
+            .with(session_id, |s| {
+                (s.credential_rejected, s.credential_key.clone())
             })
             .filter(|(rejected, _)| *rejected)
             .map(|(_, key)| {
@@ -398,9 +449,7 @@ mod component {
     /// keeps a request the component was never going to be allowed to make
     /// from reaching a human as a consent prompt.
     fn gate(id: &str, sql: &str) -> ActResult<()> {
-        let mode = SESSIONS
-            .with(|r| r.with(id, |s| s.mode))
-            .ok_or_else(|| unknown_session(id))?;
+        let mode = SESSIONS.with(id, |s| s.mode).ok_or_else(|| unknown_session(id))?;
         mode::require_tier(mode, sql)
             .map(|_| ())
             .map_err(|g: mode::GateError| ActError::capability_denied(g.summary))
@@ -686,9 +735,7 @@ mod component {
             // The session exists and holds no connection: the credential it
             // would need cannot be fetched from inside `open-session`.
             assert!(
-                SESSIONS
-                    .with(|r| r.with(&id, |s| s.conn.is_none()))
-                    .unwrap(),
+                SESSIONS.with(&id, |s| s.conn.is_none()).unwrap(),
                 "open must not connect"
             );
             close(id);
@@ -726,7 +773,7 @@ mod component {
         fn a_poisoned_session_refuses_before_it_asks_the_store_again() {
             let id = open(args("db.internal")).expect("opens");
             assert!(poisoned(&id).is_none(), "a fresh session is not poisoned");
-            SESSIONS.with(|r| r.with_mut(&id, |s| s.credential_rejected = true));
+            SESSIONS.with_mut(&id, |s| s.credential_rejected = true);
             let e = poisoned(&id).expect("poisoned");
             assert_eq!(e.kind, creds::ERR_CREDENTIAL_REQUIRED);
             assert!(e.message.contains("act secret set"), "got {}", e.message);
@@ -744,7 +791,7 @@ mod component {
             .expect("deserializes");
             let id = open(a).expect("opens");
             let (target, key) = SESSIONS
-                .with(|r| r.with(&id, |s| (s.target.clone(), s.credential_key.clone())))
+                .with(&id, |s| (s.target.clone(), s.credential_key.clone()))
                 .expect("live");
             let want = secret_request(&target, &key);
             assert_eq!(want.key, "reporting");

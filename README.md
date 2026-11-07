@@ -1,7 +1,7 @@
 # postgres
 
 A hardened PostgreSQL tool for AI agents — capability-gated, SQL-tier-enforced, and
-bounded by design. Runs as a wasip2 WebAssembly component inside the
+bounded by design. Runs as a wasip3 WebAssembly component inside the
 [ACT](https://actcore.dev) host.
 
 ## Positioning
@@ -91,7 +91,7 @@ What a DSN *may* carry, and what happens to it:
 | `dbname`, `user` | honoured, and overridden by the `dbname` / `user` session args |
 | `sslmode` | honoured, and overridden by the `sslmode` session arg |
 | `options`, `application_name`, `channel_binding` | honoured, sent at startup |
-| `connect_timeout`, `keepalives*`, `tcp_user_timeout`, `target_session_attrs`, `load_balance_hosts`, `hostaddr` | ignored — they belong to tokio-postgres's `runtime` connector, which does not build for wasm32-wasip2 |
+| `connect_timeout`, `keepalives*`, `tcp_user_timeout`, `target_session_attrs`, `load_balance_hosts`, `hostaddr` | ignored — they belong to tokio-postgres's `runtime` connector, which does not build for wasm32-wasip3 |
 
 Anything else is a parse error rather than a silent drop — including
 `sslmode=verify-full`, which tokio-postgres does not know (and see the TLS section
@@ -280,10 +280,10 @@ marker above instead of the plan.
 ## TLS
 
 TLS is implemented with pure-Rust cryptography (rustls + rustls-rustcrypto) — no
-system OpenSSL dependency, works on wasip2.
+system OpenSSL dependency, works on wasip3.
 
 **v1 limitation — encryption without authentication:** TLS handshake signatures are
-verified, but server certificate **chain** verification is skipped because wasip2
+verified, but server certificate **chain** verification is skipped because wasip3
 provides no system CA store. Both `sslmode=prefer` and `sslmode=require` attempt TLS
 but cannot verify that the server certificate is trusted by a known CA. This is
 similar in spirit to PostgreSQL's own `sslmode=require` (weaker than `verify-ca` or

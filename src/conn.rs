@@ -342,19 +342,24 @@ impl ConnTarget {
             .build()
             .map_err(|e| ConnectError::Other(format!("tokio runtime build failed: {e}")))?;
 
-        let client = rt.block_on(async move {
+        let (client, driver) = rt.block_on(async move {
             let stream = tokio::net::TcpStream::connect(addr)
                 .await
                 .map_err(|e| ConnectError::Other(format!("tcp connect {addr} failed: {e}")))?;
 
-            let client = match sslmode {
+            // Each arm spawns its own driver task (the connection type is
+            // generic over the TLS stream, so the arms cannot share a bind).
+            // The driver task owns the socket; keep its handle so teardown can
+            // wait for the socket to actually close instead of dropping the
+            // task mid-flight (see [`Connection::shutdown`]).
+            let (client, driver) = match sslmode {
                 SslMode::Disable => {
                     let (client, connection) =
                         pg_cfg.connect_raw(stream, NoTls).await.map_err(handshake)?;
-                    tokio::spawn(async move {
+                    let driver = tokio::spawn(async move {
                         let _ = connection.await;
                     });
-                    client
+                    (client, driver)
                 }
                 // v1: `prefer` attempts TLS without plaintext fallback (same as
                 // require); true prefer-fallback (reconnect on handshake failure)
@@ -372,10 +377,10 @@ impl ConnTarget {
                         .connect_raw(stream, tls_connect)
                         .await
                         .map_err(handshake)?;
-                    tokio::spawn(async move {
+                    let driver = tokio::spawn(async move {
                         let _ = connection.await;
                     });
-                    client
+                    (client, driver)
                 }
             };
 
@@ -389,10 +394,10 @@ impl ConnTarget {
                     })?;
             }
 
-            Ok::<Client, ConnectError>(client)
+            Ok::<_, ConnectError>((client, driver))
         })?;
 
-        Ok(Connection { rt, client })
+        Ok(Connection { rt, client, driver })
     }
 }
 
@@ -680,9 +685,41 @@ impl tokio_postgres::tls::TlsConnect<TcpStream> for PgTlsConnect {
 pub struct Connection {
     rt: Runtime,
     client: Client,
+    driver: tokio::task::JoinHandle<()>,
 }
 
 impl Connection {
+    /// Release the connection deterministically, inside this connection's own
+    /// async context.
+    ///
+    /// Dropping a [`Connection`] from a **synchronous** wasip3 export would
+    /// race the fiber: the tokio current-thread runtime shuts down and cancels
+    /// the driver task, whose drop path closes the TCP socket through
+    /// wasi:sockets — and under cooperative threading that close trap-fails
+    /// with "error while executing at wasm backtrace … tcp_free" when it runs
+    /// on a fiber that never awaited (observed as `std:internal` from
+    /// `close-session`). So teardown never relies on Drop: the session layer
+    /// parks the [`Connection`] where a fiber that has already awaited can
+    /// reach it (a zombie list drained by the next tool call), and this
+    /// method runs there.
+    ///
+    /// What happens here, in order: the `Client` is dropped, which closes the
+    /// tokio-postgres command channel — the driver loop sees the channel
+    /// disconnect and exits *without sending a `Terminate` message*, so the
+    /// server observes the TCP close instead. The socket then closes as part
+    /// of the driver task finishing, **on this runtime, inside this
+    /// `block_on`** — a context wasi:sockets accepts.
+    pub fn shutdown(self) {
+        let Connection { rt, client, driver } = self;
+        rt.block_on(async move {
+            drop(client);
+            // The driver exits once the command channel is gone; awaiting the
+            // handle guarantees the socket is fully closed before the runtime
+            // itself is dropped.
+            let _ = driver.await;
+        });
+    }
+
     /// Execute a read-only query and return CBOR rows, capped at `max_rows`.
     ///
     /// The query is wrapped in an explicit `BEGIN; SET TRANSACTION READ ONLY;
